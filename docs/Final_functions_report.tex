@@ -1,0 +1,260 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage[T1]{fontenc}
+
+\title{Report on the Functions and Structure of \texttt{Final.ipynb}}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+This report summarizes the main programmatic components of the Jupyter
+notebook \texttt{Final.ipynb}, which implements a series of experiments on
+cross-entropy loss sensitivity and soft errors in GPT-2.  The focus is on
+the helper functions and classes defined in the notebook, their purpose,
+and how they interact to carry out gradient-based sensitivity analysis and
+bit-flip experiments.
+\end{abstract}
+
+\section{High-Level Overview}
+
+The notebook builds several experimental pipelines around a GPT-2 language
+model:
+\begin{itemize}
+  \item loading GPT-2 and the WikiText-103 dataset;
+  \item scanning gradients to identify the parameters with the largest
+  absolute cross-entropy loss gradients;
+  \item flipping individual bits of selected parameters in floating-point
+  representation;
+  \item generating text under clean and corrupted models;
+  \item computing text-similarity and quality metrics to quantify the effect
+  of bit-flips; and
+  \item saving detailed and aggregated results to CSV files (optionally to
+  Google Drive for Colab runs).
+\end{itemize}
+
+These tasks are organized through a set of utility functions and custom
+logits processors, described in the following sections.
+
+\section{Data and Batching Utilities}
+
+\subsection{\texttt{chunk\_generator()}}
+
+The function
+\verb|chunk_generator()|
+streams documents from the WikiText-103 training split and tokenizes them
+with the GPT-2 tokenizer.  It maintains a cache of token IDs and, once
+there are at least \verb|SEQ_LEN + 1| tokens, yields overlapping
+input--target windows:
+\begin{itemize}
+  \item input sequence: the first \verb|SEQ_LEN| tokens;
+  \item target sequence: the same sequence shifted by one position.
+\end{itemize}
+This provides training-style language modeling windows for loss and
+gradient computation.
+
+\subsection{\texttt{get\_batch(gen, bs)}}
+
+The function
+\verb|get_batch(gen, bs=BATCH_SIZE)|
+consumes windows from \verb|chunk_generator()| (or any compatible
+generator), groups them into mini-batches of size \verb|bs|, and returns
+each batch as a tensor on the configured device.  It is used to feed
+mini-batches into GPT-2 when scanning gradients.
+
+\section{Gradient Scan and Bit Selection}
+
+\subsection{\texttt{normalize\_v\_select(sel, k)}}
+
+The helper
+\verb|normalize_v_select(sel, k)|
+normalizes user-configured rank selections for sensitivity analysis.
+Allowed forms include:
+\begin{itemize}
+  \item the string \verb|"all"|, which expands to all ranks
+  \verb|1, \dots, k|;
+  \item an integer, interpreted as a single rank; and
+  \item a list or tuple of integers, returned as a list.
+\end{itemize}
+Invalid inputs raise a \verb|ValueError|.  The normalized list of ranks is
+used to choose which of the top-\(K\) sensitive scalars will be tested with
+bit-flips.
+
+\subsection{\texttt{flip\_bit(val\_tensor, bit)} and \texttt{BIT\_CLASSES}}
+
+The function
+\verb|flip_bit(val_tensor: torch.Tensor, bit: int)|
+implements low-level bit manipulation for 32-bit floating-point tensors:
+\begin{itemize}
+  \item it expects a tensor of dtype \verb|float32|; otherwise a
+  \verb|TypeError| is raised;
+  \item the bit index must be between 0 and 31, inclusive; otherwise a
+  \verb|ValueError| is raised;
+  \item values are moved to CPU and viewed as \verb|uint32|; the selected
+  bit is flipped via XOR; and
+  \item the result is converted back to \verb|float32| and returned on the
+  original device with the same shape.
+\end{itemize}
+
+The dictionary \verb|BIT_CLASSES| groups bit positions into semantic
+classes:
+\begin{itemize}
+  \item \verb|"sign"|: the sign bit at position 31;
+  \item \verb|"exponent"|: bits 23--30; and
+  \item \verb|"mantissa"|: bits 0--22.
+\end{itemize}
+During experiments, the notebook samples random bit indices from these
+classes when corrupting selected parameters.
+
+\section{Metrics and Scoring}
+
+\subsection{\texttt{edit\_distance(a, b)}}
+
+The function
+\verb|edit_distance(a: str, b: str)|
+computes the Levenshtein edit distance between two strings using a dynamic
+programming algorithm implemented in a single-row style for space
+efficiency.  It returns the minimum number of insertions, deletions, or
+substitutions needed to transform \verb|a| into \verb|b|.
+
+\subsection{\texttt{score\_pair(clean, corrupt)}}
+
+The function
+\verb|score_pair(clean: str, corrupt: str)|
+computes a dictionary of similarity and quality metrics between a clean
+reference completion and a corrupted completion:
+\begin{itemize}
+  \item raw and length-normalized edit distance;
+  \item BLEU score via \verb|sacrebleu|;
+  \item METEOR score (if enabled via the \verb|evaluate| library);
+  \item BERTScore \(F_1\) (contextual similarity);
+  \item ROUGE-1, ROUGE-2, and ROUGE-L \(F_1\) scores; and
+  \item optionally BLEURT if the corresponding flag is enabled.
+\end{itemize}
+Some variants wrap metric computation in \verb|try/except| blocks to handle
+occasional errors gracefully.  The returned dictionary is merged into the
+per-trial result rows that later form detailed and aggregated CSV tables.
+
+\subsection{\texttt{llm\_judge\_score(\dots)}}
+
+The placeholder
+\verb|llm_judge_score(prompt, clean, corrupt, rubric=None)|
+is defined to optionally integrate an external LLM-based judge.  In the
+current version, when the \verb|ENABLE_LLM_JUDGE| flag is false, it returns
+an empty dictionary and does not affect downstream computations.
+
+\section{Logits Processors and Generation Helpers}
+
+\subsection{Clamp and Detection Processors}
+
+Several custom subclasses of
+\verb|transformers.generation.logits_process.LogitsProcessor|
+are defined to control and monitor the token-level logits during decoding:
+\begin{itemize}
+  \item \textbf{\texttt{NanInfClampProcessor}} replaces NaNs and infinities
+  in the logits with zeros and clamps all logits to a configurable range.
+  It can also set a flag in a shared dictionary if any NaN or Inf is
+  detected.
+  \item \textbf{\texttt{NanInfDetector}} only detects the presence of NaNs
+  or Infs in the logits and records this in a flag dictionary, without
+  modifying the logits.
+\end{itemize}
+
+\subsection{Repetition Guards}
+
+To reduce degenerate repetitive outputs, the notebook defines two related
+processors:
+\begin{itemize}
+  \item \textbf{\texttt{MaxConsecutiveRepeatProcessor}} counts how many
+  times the last generated token has been repeated consecutively in the
+  sequence.  If this count exceeds a threshold, it sets the corresponding
+  logit to a large negative value, effectively banning that token.
+  \item \textbf{\texttt{MaxRepeatGuard}} implements the same idea in other
+  experimental blocks, again limiting excessive consecutive repetition of
+  the last token.
+\end{itemize}
+
+\subsection{Clean and Corrupt Generation Functions}
+
+The notebook defines several helper functions for text generation from GPT-2:
+\begin{itemize}
+  \item \verb|generate_tail_clean(prompt, max_new_tokens)| runs greedy
+  decoding without custom processors and returns only the continuation
+  tokens following the prompt.
+  \item \verb|generate_tail_corrupt(prompt, max_new_tokens)| uses a
+  \verb|LogitsProcessorList| that includes \verb|NanInfClampProcessor| and
+  \verb|MaxConsecutiveRepeatProcessor|, and returns both the generated
+  continuation and a boolean flag indicating whether NaNs were encountered.
+  \item \verb|generate_clean(prompt)| and \verb|generate_corrupt(prompt)|
+  implement similar logic for other experimental configurations, using
+  \verb|NanInfDetector| and \verb|MaxRepeatGuard|.
+  \item The internal helper \verb|_generate(prompt, corrupt=False)| wraps
+  all decoding strategy options (greedy, top-\(k\), top-\(p\), and
+  temperature) and is used to define \verb|generate_clean| and
+  \verb|generate_corrupt| via lightweight wrappers.
+\end{itemize}
+All of these helpers ensure that only the newly generated tokens beyond the
+prompt are returned, allowing straightforward comparison between clean and
+corrupted outputs.
+
+\section{Result Aggregation and Output Helpers}
+
+\subsection{\texttt{\_truncate(s, w)}}
+
+The function
+\verb|_truncate(s, w=MAX_COL_WIDTH)|
+shortens long string fields (such as prompts and completions) to a maximum
+width \(w\), appending an ellipsis character when truncation occurs.  It is
+used solely for prettier console tables and does not affect the underlying
+CSV data.
+
+\subsection{DataFrame Construction and Saving}
+
+After running the bit-flip experiments, the notebook builds a
+\verb|pandas.DataFrame| in which each row contains:
+\begin{itemize}
+  \item metadata about the flipped parameter (rank, tensor name, index,
+  bit class, bit index, trial index);
+  \item the prompt, clean continuation, and corrupted continuation; and
+  \item all scalar metrics produced by \verb|score_pair| (and, in
+  principle, \verb|llm_judge_score|).
+\end{itemize}
+
+Helper code then:
+\begin{itemize}
+  \item prints a preview table using \verb|tabulate|;
+  \item saves per-trial results to \verb|bitflip_per_trial.csv|;
+  \item aggregates metrics across trials using group-by and summary
+  statistics (mean, median, standard deviation); and
+  \item saves aggregated results to \verb|bitflip_aggregated.csv|, often
+  both locally and to a Google Drive folder when running in Colab.
+\end{itemize}
+
+\section{Summary}
+
+In summary, \texttt{Final.ipynb} is structured around a reusable set of
+functions and custom logits processors that together:
+\begin{enumerate}
+  \item construct language modeling mini-batches from WikiText-103;
+  \item scan gradients to identify the most sensitivity-critical GPT-2
+  parameters;
+  \item apply controlled bit-flips to those parameters;
+  \item generate clean and corrupted completions under multiple decoding
+  strategies; and
+  \item quantify and record the impact of soft errors using a rich set of
+  text similarity metrics.
+\end{enumerate}
+The described functions encapsulate these responsibilities cleanly, making
+it straightforward to run new sensitivity experiments or extend the
+analysis with additional metrics and decoding schemes.
+
+\end{document}
+
